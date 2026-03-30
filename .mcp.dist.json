@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "scalyr": {
+      "command": "npx",
+      "args": ["tsx", "src/index.ts"],
+      "env": {
+        "SCALYR_API_READ_KEY": "${SCALYR_API_READ_KEY}"
+      }
+    }
+  }
+}

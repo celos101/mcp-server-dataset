@@ -15,6 +15,10 @@
     "build": "tsc && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
     "watch": "tsc --watch",
+    "test": "vitest run --exclude tests/integration.test.ts",
+    "test:integration": "vitest run tests/integration.test.ts",
+    "test:all": "vitest run",
+    "test:watch": "vitest --exclude tests/integration.test.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -41,6 +45,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.0.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.2"
   }
 }
