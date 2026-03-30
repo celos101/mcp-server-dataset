@@ -18,24 +18,58 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
+const READ_ONLY_HINTS = {
+  readOnlyHint: true as const,
+  destructiveHint: false as const,
+  openWorldHint: true as const,
+};
+
 server.tool(
-  "query_logs",
-  "Search Scalyr/DataSet logs with automatic pagination. Returns matching log events with their timestamps, messages, and parsed attributes. The filter uses Scalyr query syntax, e.g. '$serverHost == \"myserver\" level == \"ERROR\"'.",
+  "scalyr_query_logs",
+  `Search Scalyr/DataSet logs with automatic pagination. Returns matching log events with timestamps, messages, and parsed attributes.
+
+Recommended workflow: use scalyr_facets or scalyr_count first to understand the data volume, then use this tool with a targeted filter and small maxCount.
+
+Filter syntax examples:
+  - $serverHost == "myserver" level == "ERROR"
+  - $serverHost == "bank-cron" (level == "ERROR" || level == "CRITICAL")
+  - $logfile == "/var/log/app.log" status >= 500
+
+Tips:
+  - Use a narrow time range and specific filters to avoid scanning too much data.
+  - The API scans forward from startTime — if most logs are INFO, errors near the end of the range may not be reached with low priority. Use priority "high" or a narrower time window.
+  - Start with maxCount 20-50 to preview results before requesting more.`,
   {
-    filter: z.string().describe("Scalyr filter expression, e.g. '$serverHost == \"myserver\" level == \"ERROR\"'"),
+    filter: z.string().describe('Scalyr filter expression, e.g. \'$serverHost == "myserver" level == "ERROR"\''),
     startTime: z.string().describe("Start of time range. Relative (e.g. '60m', '24h', '7d') or absolute timestamp"),
-    endTime: z.string().optional().describe("End of time range. Relative or absolute timestamp. Defaults to now"),
-    maxCount: z.number().int().min(1).max(5000).default(500).describe("Maximum number of log events to return (default 500, max 5000)"),
-    maxPages: z.number().int().min(1).max(50).default(10).describe("Maximum pagination requests to prevent runaway queries (default 10)"),
-    priority: z.enum(["low", "medium", "high"]).default("low").describe("Scanning budget priority. 'low' is cheapest, 'high' scans more data"),
+    endTime: z.string().optional().describe("End of time range. Defaults to now"),
+    maxCount: z.number().int().min(1).max(5000).default(100).describe("Maximum log events to return. Start small (20-50) to preview, increase if needed. Default 100, max 5000"),
+    maxPages: z.number().int().min(1).max(50).default(10).describe("Maximum pagination requests (default 10). Increase only if you need a large result set"),
+    priority: z.enum(["low", "medium", "high"]).default("low").describe("Scanning budget. 'low' is cheapest but may miss events in large time ranges. Use 'high' for thorough searches"),
+  },
+  {
+    ...READ_ONLY_HINTS,
   },
   async ({ filter, startTime, endTime, maxCount, maxPages, priority }) => {
     try {
       const matches = await client.queryLogs(filter, startTime, maxCount, maxPages, priority, endTime);
+
+      const truncated = matches.length >= maxCount;
+      const summary = `Found ${matches.length} log event(s)${truncated ? ` (limited to maxCount=${maxCount}, there may be more)` : ""}.`;
+
+      const formatted = matches.map((m) => {
+        const ts = new Date(Number(m.timestamp) / 1e6).toISOString();
+        const attrs = Object.entries(m.attributes)
+          .filter(([k]) => !k.startsWith("__"))
+          .map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`)
+          .join("\n");
+        return `[${ts}] ${m.message}${attrs ? "\n" + attrs : ""}`;
+      });
+
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ matchCount: matches.length, matches }, null, 2),
+          text: `${summary}\n\n${formatted.join("\n\n")}`,
         }],
       };
     } catch (error) {
@@ -51,12 +85,17 @@ server.tool(
 );
 
 server.tool(
-  "count",
-  "Count the number of log events matching a filter. Uses Scalyr's numericQuery endpoint. Note: this uses text matching internally, so counts may be slightly inflated compared to exact field matching.",
+  "scalyr_count",
+  `Count log events matching a filter. Fast way to check data volume before querying full logs.
+
+Note: uses Scalyr's numericQuery which does text matching, so counts may be slightly higher than exact field matching. For precise counts, use scalyr_power_query.`,
   {
     filter: z.string().describe("Scalyr filter expression"),
     startTime: z.string().describe("Start of time range. Relative (e.g. '60m', '24h', '7d') or absolute timestamp"),
     endTime: z.string().optional().describe("End of time range. Defaults to now"),
+  },
+  {
+    ...READ_ONLY_HINTS,
   },
   async ({ filter, startTime, endTime }) => {
     try {
@@ -64,7 +103,7 @@ server.tool(
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ count }),
+          text: `${count} matching event(s) for filter: ${filter}`,
         }],
       };
     } catch (error) {
@@ -80,22 +119,29 @@ server.tool(
 );
 
 server.tool(
-  "facets",
-  "Get the distribution of values for a specific field across matching log events. Useful for understanding what values a field takes and how frequently.",
+  "scalyr_facets",
+  `Get the value distribution for a field across matching logs. Great first step to understand what's in your logs before querying details.
+
+Example: use field "level" to see how many ERROR vs INFO vs WARNING events exist, or "$serverHost" to see which servers are logging.`,
   {
     filter: z.string().describe("Scalyr filter expression"),
-    field: z.string().describe("Field name to get value distribution for, e.g. 'level', 'status', '$serverHost'"),
+    field: z.string().describe("Field name, e.g. 'level', 'status', '$serverHost', '$logfile'"),
     startTime: z.string().describe("Start of time range. Relative (e.g. '60m', '24h', '7d') or absolute timestamp"),
     endTime: z.string().optional().describe("End of time range. Defaults to now"),
-    maxCount: z.number().int().min(1).max(1000).default(50).describe("Maximum number of distinct values to return (default 50)"),
+    maxCount: z.number().int().min(1).max(1000).default(50).describe("Maximum distinct values to return (default 50)"),
+  },
+  {
+    ...READ_ONLY_HINTS,
   },
   async ({ filter, field, startTime, endTime, maxCount }) => {
     try {
       const result = await client.facets(filter, field, startTime, maxCount, endTime);
+
+      const lines = result.values.map((v) => `  ${v.value}: ${v.count}`);
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify(result, null, 2),
+          text: `${result.matchCount} total event(s), field "${field}" distribution:\n${lines.join("\n")}`,
         }],
       };
     } catch (error) {
@@ -111,12 +157,20 @@ server.tool(
 );
 
 server.tool(
-  "power_query",
-  "Run a Scalyr PowerQuery expression. PowerQueries support aggregation, grouping, filtering and other advanced operations. Example: '$serverHost == \"bank-cron\" level == \"ERROR\" | group count() by status'.",
+  "scalyr_power_query",
+  `Run a Scalyr PowerQuery expression for advanced aggregation, grouping, and filtering. Use this for analytics-style queries.
+
+Examples:
+  - $serverHost == "bank-cron" level == "ERROR" | group count() by status
+  - $logfile == "/var/log/app.log" | group count(), avg(duration) by endpoint | sort -count
+  - level == "ERROR" | columns timestamp, message, $serverHost`,
   {
-    query: z.string().describe("PowerQuery expression"),
+    query: z.string().describe("PowerQuery expression including filter and pipe stages"),
     startTime: z.string().describe("Start of time range. Relative (e.g. '60m', '24h', '7d') or absolute timestamp"),
     endTime: z.string().optional().describe("End of time range. Defaults to now"),
+  },
+  {
+    ...READ_ONLY_HINTS,
   },
   async ({ query, startTime, endTime }) => {
     try {
@@ -140,10 +194,13 @@ server.tool(
 );
 
 server.tool(
-  "get_file",
-  "Retrieve a configuration file stored in Scalyr/DataSet. Common paths include '/scalyr/alerts' for alert configurations.",
+  "scalyr_get_file",
+  "Retrieve a configuration file stored in Scalyr/DataSet. Common paths: '/scalyr/alerts' (alert configs), '/scalyr/searches' (saved searches).",
   {
     path: z.string().describe("File path in Scalyr, e.g. '/scalyr/alerts'"),
+  },
+  {
+    ...READ_ONLY_HINTS,
   },
   async ({ path }) => {
     try {
